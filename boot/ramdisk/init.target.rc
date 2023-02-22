@@ -1,0 +1,231 @@
+# Copyright (c) 2013, The Linux Foundation. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer in the documentation and/or other materials provided
+#       with the distribution.
+#     * Neither the name of The Linux Foundation nor the names of its
+#       contributors may be used to endorse or promote products derived
+#       from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED "AS IS" AND ANY EXPRESS OR IMPLIED
+# WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS
+# BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+# CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+# SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR
+# BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+# WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
+# OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+# IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+#
+
+on early-init
+    mkdir /firmware 0771 system system
+    symlink /data/tombstones /tombstones
+
+on init
+   mkdir /dev/logd 0770 logd log
+   mount tmpfs tmpfs /dev/logd mode=0770,uid=1036,gid=1036,size=512K,context=u:object_r:logd_tmpfs:s0
+
+on early-boot
+   exec /system/bin/sh /etc/init.hdmi.early_boot.sh
+
+# import cne init file
+on post-fs
+    export LD_PRELOAD /vendor/lib/libNimsWrap.so
+
+on fs
+    # Keeping system partition out of fstab file, in order to use resize2fs to modify
+    # data partition, before it gets mounted in fstab.
+    wait /dev/block/platform/msm_sdcc.1/by-name/system
+    mount ext4 /dev/block/bootdevice/by-name/system /system ro barrier=1 discard
+
+    # Keeping the user data partitions outside of the fstab file.
+    # In order to fit different sizes of devices, the user data image needs to be created small and resized during init.
+
+    wait /dev/block/bootdevice/by-name/cache
+    exec /system/bin/e2fsck -y -f /dev/block/bootdevice/by-name/cache
+    mount ext4 /dev/block/bootdevice/by-name/cache /cache nosuid nodev barrier=1
+
+    wait /dev/block/bootdevice/by-name/userdata
+    exec /system/bin/sh /system/etc/resize_user_data.sh
+    wait /dev/block/bootdevice/by-name/userdata
+    mount_all fstab.qcom
+
+    # Keeping following partitions outside fstab file. As user may not have
+    # these partition flashed on the device. Failure to mount any partition in fstab file
+    # results in failure to launch late-start class.
+
+    wait /dev/block/bootdevice/by-name/cache
+    mount ext4 /dev/block/bootdevice/by-name/cache /cache nosuid nodev barrier=1
+
+    wait /dev/block/bootdevice/by-name/persist
+    mount ext4 /dev/block/bootdevice/by-name/persist /persist nosuid nodev barrier=1,context=u:object_r:persist_file:s0
+
+    wait /dev/block/bootdevice/by-name/persistbackup
+    mount ext4 /dev/block/bootdevice/by-name/persistbackup /persistbackup nosuid nodev barrier=1,context=u:object_r:persist_file:s0
+
+    wait /dev/block/bootdevice/by-name/modem
+    mount vfat /dev/block/bootdevice/by-name/modem /firmware ro shortname=lower,uid=1000,gid=1000,dmask=227,fmask=337,context=u:object_r:firmware_file:s0
+    write /sys/kernel/boot_adsp/boot 1
+
+on post-fs-data
+    mkdir /data/tombstones 0771 system system
+    mkdir /tombstones/modem 0771 system system
+    mkdir /tombstones/lpass 0771 system system
+    mkdir /tombstones/wcnss 0771 system system
+    mkdir /tombstones/dsps 0771 system system
+    mkdir /data/misc/perfd 0771 system system
+
+# Allow usb charging to be disabled peristently
+on property:persist.usb.chgdisabled=1
+    write /sys/class/power_supply/battery/charging_enabled 0
+
+on property:persist.usb.chgdisabled=0
+    write /sys/class/power_supply/battery/charging_enabled 1
+
+service qrngd /system/bin/qrngd -f
+   class main
+   user root
+   group root
+
+service mpdecision /system/bin/mpdecision --no_sleep --avg_comp
+   class main
+   user root
+   disabled
+
+service thermal-engine /system/bin/thermal-engine
+   class main
+   user root
+   group root
+
+service time_daemon /system/bin/time_daemon
+   class late_start
+   user root
+   group root
+
+service audiod /system/bin/audiod
+   class late_start
+   user system
+   group system
+
+on boot
+   exec /system/bin/sh /etc/init.set_model.sh
+   insmod /system/lib/modules/adsprpc.ko
+   # Bluetooth LPM
+   chown bluetooth net_bt_stack /proc/bluetooth/sleep/lpm
+   chown bluetooth net_bt_stack /proc/bluetooth/sleep/btwrite
+   export SECONDARY_STORAGE_USB /storage/usbdisk
+
+service mdm_helper /system/bin/mdm_helper
+    class core
+    onrestart setprop ro.service.mdm_helper_restarted "true"
+    disabled
+
+on property:ro.baseband=mdm
+    mkdir /data/misc/mdmhelperdata 0700
+    start mdm_helper
+
+#start camera server as daemon
+service qcamerasvr /system/bin/mm-qcamera-daemon
+    class late_start
+    user camera
+    group camera system inet input graphics
+
+service mdm_launcher /system/bin/sh /init.mdm.sh
+    class main
+    oneshot
+
+service ppd /system/bin/mm-pp-daemon --enable-ad
+    class late_start
+    user system
+    socket pps stream 0666 system system u:r:mm-pp-daemon:s0
+    group system graphics
+
+on property:init.svc.surfaceflinger=stopped
+    stop ppd
+
+on property:vold.decrypt=trigger_reset_main
+    stop gnss-svcd
+
+# QCA1530 SoC core detect
+service gnss-detect /system/vendor/bin/gnss.qca1530.sh detect
+   class core
+   oneshot
+
+# QCA1530 SoC late_start group trigger
+service gnss-init /system/vendor/bin/gnss.qca1530.sh init
+   class late_start
+   oneshot
+
+# QCA1530 SoC Service Daemon
+service gnss-svcd /system/vendor/bin/gnss.qca1530.sh start
+   class late_start
+   user root
+   group gps system qcom_diag diag log inet net_raw
+   disabled
+
+#start GNSS/Sensor interface daemon
+#service gsiff_daemon /system/bin/gsiff_daemon
+#    class late_start
+#    user gps
+#    group gps net_raw misc
+
+#Auto-shutdown script
+service auto_shutdown /system/bin/sh /system/bin/auto_shutdown.sh
+   class late_start
+   user root
+   group system
+   oneshot
+   disabled
+
+service bdAddrLoader /system/bin/bdAddrLoader -f /proc/idme/bt_mac_addr -c -x
+    class main
+    user bluetooth
+    group system bluetooth
+    oneshot
+
+service qseecomd /system/bin/qseecomd
+    class core
+    user root
+    group root
+
+
+# ACOS_MOD_BEGIN {amazon_telephony}
+#restart Start RIL script once disk decrypts
+on property:vold.decrypt=trigger_reset_main
+    start startril
+
+#conditional start RIL for non-wifi devices
+service startril /system/bin/wan_start
+    class main
+    oneshot
+# ACOS_MOD_END {amazon_telephony}
+
+#Auto-reprovision script
+on property:init.svc.qseecomd=running
+    start sepolicy_patch
+    start reprovision
+
+service sepolicy_patch /system/bin/sepolicy_patch.sh
+    class late_start
+    user root
+    group root
+    oneshot
+    disabled
+
+service reprovision /system/bin/reprov_Saturn.sh
+    class late_start
+    user root
+    group root
+    oneshot
+    disabled
+
